@@ -1,6 +1,14 @@
-<#
-.SYNOPSIS
-Installs Windows drivers with class filtering, concurrent downloading, chipset prioritization, and progress visualizers.
+<#PSScriptInfo
+
+.VERSION 1.0
+
+.AUTHOR drkmccy
+
+.RELEASENOTES
+
+Version 1.01:    Single table output, tidied column headers, reboot prompt
+Version 1.00:    Added connectivity check, download concurrency, driver type filters, installation priority and visual overhaul.
+
 #>
 
 [CmdletBinding()]
@@ -96,7 +104,7 @@ Process {
         Exit 0
     }
 
-    # Class Keyword Mapping & Title Filtering
+    # Driver Type Keyword Mapping & Title Filtering
     $ClassMap = @{
         'n' = "Network|Wi-Fi|Wireless|WLAN|Ethernet|Bluetooth|LAN|NIC"
         'f' = "Firmware|BIOS|System Hardware"
@@ -151,37 +159,51 @@ Process {
     }
     $OrderedUpdates = $chipsetGroup + $otherGroup
 
-    # Assemble updates into collection for downloading
+    # Verbose Download Details Output
+    $TotalCount = $OrderedUpdates.Count
+    $padWidth   = $TotalCount.ToString().Length
+
+    Write-Host "`nPreparing to download $TotalCount driver(s):" -ForegroundColor Cyan
     $DownloadColl = New-Object -ComObject Microsoft.Update.UpdateColl
+    
+    $dlCounter = 0
     foreach ($upd in $OrderedUpdates) {
+        $dlCounter++
+        $countStr = $dlCounter.ToString("D$padWidth")
         [void]$DownloadColl.Add($upd)
+        
+        # Calculate file size in MB
+        $sizeMB = [math]::Round($upd.MaxDownloadSize / 1MB, 2)
+        $sizeDisplay = if ($sizeMB -gt 0) { "$sizeMB MB" } else { "< 1 MB" }
+        
+        Write-Host "  [$countStr/$TotalCount] $sizeDisplay - $($upd.Title)" -ForegroundColor Gray
     }
 
-    # Batch Download Execution
-    Write-Host "Starting batch download for $($OrderedUpdates.Count) driver(s)..." -ForegroundColor Cyan
-    Write-Progress -Activity "Downloading Drivers" -Status "Downloading $($OrderedUpdates.Count) drivers..." -PercentComplete 50
+    # Batch Concurrent Background Download Execution
+    Write-Host "`nDownloading drivers in parallel..." -ForegroundColor Cyan
+    Write-Progress -Activity "Downloading Drivers" -Status "Downloading $TotalCount drivers..." -PercentComplete 50
 
     $Downloader = $Session.CreateUpdateDownloader()
     $Downloader.Updates = $DownloadColl
     $DownloadResult = $Downloader.Download()
 
     Write-Progress -Activity "Downloading Drivers" -Completed
-    Write-Host "[+] Batch driver download complete (Result Code: $($DownloadResult.ResultCode)).`n" -ForegroundColor Green
+    Write-Host "[+] Driver batch download completed.`n" -ForegroundColor Green
 
-    # Sequential Installation & Visual UI Tracking
-    $TotalCount   = $OrderedUpdates.Count
-    $CurrentIndex = 0
-    $ResultsList  = [System.Collections.Generic.List[PSCustomObject]]::new()
+    # Live-Updating Console Table Header
     $script:needReboot = $false
+    $CurrentIndex = 0
 
-    Write-Host "Starting Driver Installation Sequence..." -ForegroundColor Cyan
+    Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "Count", "Status", "Title", "Type", "Reboot Needed") -ForegroundColor Cyan
+    Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "-----", "------", "-----", "----", "-------------") -ForegroundColor DarkGray
 
+    # Installation Loop
     foreach ($upd in $OrderedUpdates) {
         $CurrentIndex++
-        $Remaining = $TotalCount - $CurrentIndex
+        $countStr = $CurrentIndex.ToString("D$padWidth")
 
         Write-Progress -Activity "Installing Drivers" `
-            -Status "[$CurrentIndex/$TotalCount] Installing: $($upd.Title)" `
+            -Status "[$countStr/$TotalCount] Installing: $($upd.Title)" `
             -PercentComplete (($CurrentIndex / $TotalCount) * 100)
 
         $InstallColl = New-Object -ComObject Microsoft.Update.UpdateColl
@@ -195,55 +217,49 @@ Process {
         $isSuccess = ($InstallResult.ResultCode -eq 2)
         if ($InstallResult.RebootRequired) { $script:needReboot = $true }
 
-        # Real-time Colored Console Feedback
+        # Tag Type Classification
+        $type = "Other"
+        if ($upd.Title -match $chipsetRegex)      { $type = "Chipset" }
+        elseif ($upd.Title -match $ClassMap['n']) { $type = "Networking" }
+        elseif ($upd.Title -match $ClassMap['v']) { $type = "Video" }
+        elseif ($upd.Title -match $ClassMap['s']) { $type = "Sound" }
+        elseif ($upd.Title -match $ClassMap['f']) { $type = "Firmware" }
+        elseif ($upd.Title -match $ClassMap['t']) { $type = "Touchpad" }
+
+        $titleDisplay = if ($upd.Title.Length -gt 47) { $upd.Title.Substring(0, 44) + "..." } else { $upd.Title }
+        $rebootNeededStr = if ($InstallResult.RebootRequired) { "Yes" } else { "No" }
+
+        # Stream formatted row live as each installation completes
+        Write-Host ("{0,-7} " -f $countStr) -NoNewline
         if ($isSuccess) {
-            Write-Host "[SUCCESS] ($CurrentIndex/$TotalCount) $($upd.Title) | Remaining: $Remaining" -ForegroundColor Green
+            Write-Host ("{0,-11} " -f "[SUCCESS]") -ForegroundColor Green -NoNewline
         } else {
-            Write-Host "[FAILED]  ($CurrentIndex/$TotalCount) $($upd.Title) (HResult: $($InstallResult.HResult)) | Remaining: $Remaining" -ForegroundColor Red
+            Write-Host ("{0,-11} " -f "[FAILED]") -ForegroundColor Red -NoNewline
         }
-
-        # Tag Category for Final Summary Table
-        $cat = "Other"
-        if ($upd.Title -match $chipsetRegex)    { $cat = "Chipset" }
-        elseif ($upd.Title -match $ClassMap['n']) { $cat = "Networking" }
-        elseif ($upd.Title -match $ClassMap['v']) { $cat = "Video" }
-        elseif ($upd.Title -match $ClassMap['s']) { $cat = "Sound" }
-        elseif ($upd.Title -match $ClassMap['f']) { $cat = "Firmware" }
-        elseif ($upd.Title -match $ClassMap['t']) { $cat = "Touchpad" }
-
-        $ResultsList.Add([PSCustomObject]@{
-            Step         = "$CurrentIndex/$TotalCount"
-            Category     = $cat
-            DriverTitle  = $upd.Title
-            Status       = if ($isSuccess) { "Success" } else { "Failed" }
-            RebootNeeded = $InstallResult.RebootRequired
-        })
+        Write-Host ("{0,-50} {1,-15} {2}" -f $titleDisplay, $type, $rebootNeededStr)
     }
 
     Write-Progress -Activity "Installing Drivers" -Completed
+    Write-Host ""
 
-    # Final Display Table Output
-    Write-Host "`n======================= Driver Installation Results =======================" -ForegroundColor Cyan
-    $ResultsList | Format-Table -AutoSize
-
-    # System Reboot Handling
+    # Interactive Reboot Verification
     if ($script:needReboot) {
-        Write-Host "Windows Update indicates a reboot is required." -ForegroundColor Yellow
-        if ($Reboot -eq "Hard") {
+        Write-Host "[!] A system reboot is required to complete driver installation." -ForegroundColor Yellow
+        $rebootChoice = Read-Host "Would you like to reboot immediately? (Y/N) [Default: N]"
+        
+        if ($rebootChoice -match "^[Yy]$") {
+            Write-Host "Rebooting system..." -ForegroundColor Red
             Stop-Transcript
-            Exit 1641
-        } elseif ($Reboot -eq "Soft") {
+            & shutdown.exe /r /t 0 /c "Rebooting to complete driver installation."
+            Exit 0
+        } else {
+            Write-Host "Reboot deferred. Please reboot your computer later to apply updates." -ForegroundColor Yellow
             Stop-Transcript
-            Exit 3010
-        } elseif ($Reboot -eq "Delayed") {
-            Write-Host "Scheduling reboot in $RebootTimeout seconds..." -ForegroundColor Yellow
-            & shutdown.exe /r /t $RebootTimeout /c "Rebooting to complete driver installation."
             Exit 0
         }
     } else {
         Write-Host "All driver updates completed without requiring a reboot." -ForegroundColor Green
+        Stop-Transcript
+        Exit 0
     }
-
-    Stop-Transcript
-    Exit 0
 }
