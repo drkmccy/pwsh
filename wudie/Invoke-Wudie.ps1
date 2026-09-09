@@ -5,11 +5,12 @@
 .AUTHOR drkmccy
 
 .RELEASENOTES
-
-Version 1.01:    Single table output, tidied column headers, reboot prompt
-Version 1.00:    Added connectivity check, download concurrency, driver type filters, installation priority and visual overhaul.
+Version 1.02:	Dropped download concurrency so switched to interleaved download>Install pipeline
+Version 1.01:	Single table output, tidied column headers, reboot prompt
+Version 1.00:	Added connectivity check, download concurrency, driver type filters, installation priority and visual overhaul.
 
 #>
+
 
 [CmdletBinding()]
 Param(
@@ -159,58 +160,45 @@ Process {
     }
     $OrderedUpdates = $chipsetGroup + $otherGroup
 
-    # Verbose Download Details Output
-    $TotalCount = $OrderedUpdates.Count
-    $padWidth   = $TotalCount.ToString().Length
-
-    Write-Host "`nPreparing to download $TotalCount driver(s):" -ForegroundColor Cyan
-    $DownloadColl = New-Object -ComObject Microsoft.Update.UpdateColl
-    
-    $dlCounter = 0
-    foreach ($upd in $OrderedUpdates) {
-        $dlCounter++
-        $countStr = $dlCounter.ToString("D$padWidth")
-        [void]$DownloadColl.Add($upd)
-        
-        # Calculate file size in MB
-        $sizeMB = [math]::Round($upd.MaxDownloadSize / 1MB, 2)
-        $sizeDisplay = if ($sizeMB -gt 0) { "$sizeMB MB" } else { "< 1 MB" }
-        
-        Write-Host "  [$countStr/$TotalCount] $sizeDisplay - $($upd.Title)" -ForegroundColor Gray
-    }
-
-    # Batch Concurrent Background Download Execution
-    Write-Host "`nDownloading drivers in parallel..." -ForegroundColor Cyan
-    Write-Progress -Activity "Downloading Drivers" -Status "Downloading $TotalCount drivers..." -PercentComplete 50
-
-    $Downloader = $Session.CreateUpdateDownloader()
-    $Downloader.Updates = $DownloadColl
-    $DownloadResult = $Downloader.Download()
-
-    Write-Progress -Activity "Downloading Drivers" -Completed
-    Write-Host "[+] Driver batch download completed.`n" -ForegroundColor Green
-
-    # Live-Updating Console Table Header
-    $script:needReboot = $false
+    # Setup Dynamic Counters and Visual Table Header
+    $TotalCount   = $OrderedUpdates.Count
+    $padWidth     = $TotalCount.ToString().Length
     $CurrentIndex = 0
+    $script:needReboot = $false
 
+    Write-Host "`nProcessing $TotalCount driver update(s)...`n" -ForegroundColor Cyan
     Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "Count", "Status", "Title", "Type", "Reboot Needed") -ForegroundColor Cyan
     Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "-----", "------", "-----", "----", "-------------") -ForegroundColor DarkGray
 
-    # Installation Loop
+    # Streamlined Download & Install Pipeline Loop
     foreach ($upd in $OrderedUpdates) {
         $CurrentIndex++
         $countStr = $CurrentIndex.ToString("D$padWidth")
 
-        Write-Progress -Activity "Installing Drivers" `
-            -Status "[$countStr/$TotalCount] Installing: $($upd.Title)" `
+        # Calculate Size
+        $sizeMB = [math]::Round($upd.MaxDownloadSize / 1MB, 2)
+        $sizeDisplay = if ($sizeMB -gt 0) { "$sizeMB MB" } else { "< 1 MB" }
+
+        # Single Item Collection
+        $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
+        [void]$singleColl.Add($upd)
+
+        # 1. Download Step
+        Write-Progress -Activity "Driver Processing [$countStr/$TotalCount]" `
+            -Status "Downloading ($sizeDisplay): $($upd.Title)" `
+            -PercentComplete ((($CurrentIndex - 0.5) / $TotalCount) * 100)
+
+        $Downloader = $Session.CreateUpdateDownloader()
+        $Downloader.Updates = $singleColl
+        $DownloadResult = $Downloader.Download()
+
+        # 2. Install Step
+        Write-Progress -Activity "Driver Processing [$countStr/$TotalCount]" `
+            -Status "Installing: $($upd.Title)" `
             -PercentComplete (($CurrentIndex / $TotalCount) * 100)
 
-        $InstallColl = New-Object -ComObject Microsoft.Update.UpdateColl
-        [void]$InstallColl.Add($upd)
-
         $Installer = $Session.CreateUpdateInstaller()
-        $Installer.Updates = $InstallColl
+        $Installer.Updates = $singleColl
         $Installer.ForceQuiet = $true
 
         $InstallResult = $Installer.Install()
@@ -229,7 +217,7 @@ Process {
         $titleDisplay = if ($upd.Title.Length -gt 47) { $upd.Title.Substring(0, 44) + "..." } else { $upd.Title }
         $rebootNeededStr = if ($InstallResult.RebootRequired) { "Yes" } else { "No" }
 
-        # Stream formatted row live as each installation completes
+        # Output dynamic row immediately upon install completion
         Write-Host ("{0,-7} " -f $countStr) -NoNewline
         if ($isSuccess) {
             Write-Host ("{0,-11} " -f "[SUCCESS]") -ForegroundColor Green -NoNewline
@@ -239,7 +227,7 @@ Process {
         Write-Host ("{0,-50} {1,-15} {2}" -f $titleDisplay, $type, $rebootNeededStr)
     }
 
-    Write-Progress -Activity "Installing Drivers" -Completed
+    Write-Progress -Activity "Driver Processing" -Completed
     Write-Host ""
 
     # Interactive Reboot Verification
