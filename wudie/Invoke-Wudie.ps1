@@ -1,16 +1,19 @@
 <#PSScriptInfo
 
-.VERSION 1.0
+.SYNOPSIS
+Installs Windows drivers with class filtering, per-driver streaming downloads/installs, chipset prioritization, live visual reporting, and interactive reboot handling.
+
+.VERSION 1.03
 
 .AUTHOR drkmccy
 
 .RELEASENOTES
+Version 1.03:	Connectivity check changed to actual Microsoft endpoints, driver type mapping improved
 Version 1.02:	Dropped download concurrency so switched to interleaved download>Install pipeline
 Version 1.01:	Single table output, tidied column headers, reboot prompt
 Version 1.00:	Added connectivity check, download concurrency, driver type filters, installation priority and visual overhaul.
 
 #>
-
 
 [CmdletBinding()]
 Param(
@@ -22,16 +25,29 @@ Param(
 )
 
 Begin {
-    # 1. Internet Connectivity Verification
+    # 1. Internet & Endpoint Connectivity Verification
     function Test-InternetAccess {
+        $endpoints = @("download.windowsupdate.com", "sls.update.microsoft.com", "www.microsoft.com")
         do {
-            Write-Host "Checking internet connectivity..." -ForegroundColor Cyan
-            $isOnline = Test-Connection -ComputerName "www.microsoft.com" -Count 1 -Quiet -ErrorAction SilentlyContinue
-            if (-not $isOnline) {
-                $isOnline = Test-Connection -ComputerName "1.1.1.1" -Count 1 -Quiet -ErrorAction SilentlyContinue
+            Write-Host "Checking connectivity to Windows Update endpoints..." -ForegroundColor Cyan
+            $isOnline = $false
+            
+            foreach ($endpoint in $endpoints) {
+                # Try standard ICMP Ping first
+                if (Test-Connection -ComputerName $endpoint -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                    $isOnline = $true
+                    break
+                }
+                # Fallback to TCP Port 443 check if ICMP is blocked on the network
+                $tcpTest = Test-NetConnection -ComputerName $endpoint -Port 443 -WarningAction SilentlyContinue
+                if ($tcpTest.TcpTestSucceeded) {
+                    $isOnline = $true
+                    break
+                }
             }
+
             if (-not $isOnline) {
-                Write-Host "[!] No internet connection detected." -ForegroundColor Red
+                Write-Host "[!] Cannot reach Windows Update endpoints ($($endpoints -join ', '))." -ForegroundColor Red
                 $choice = Read-Host "Connect to the internet and press Enter to retry (or type 'Q' to quit)"
                 if ($choice -eq 'Q' -or $choice -eq 'q') {
                     Write-Host "Execution cancelled." -ForegroundColor Yellow
@@ -39,7 +55,7 @@ Begin {
                 }
             }
         } while (-not $isOnline)
-        Write-Host "[+] Internet connection confirmed.`n" -ForegroundColor Green
+        Write-Host "[+] Connection to Windows Update endpoints confirmed.`n" -ForegroundColor Green
     }
 }
 
@@ -107,12 +123,12 @@ Process {
 
     # Driver Type Keyword Mapping & Title Filtering
     $ClassMap = @{
-        'n' = "Network|Wi-Fi|Wireless|WLAN|Ethernet|Bluetooth|LAN|NIC"
+        'n' = "Network|Wi-Fi|Wireless|WLAN|Ethernet|Bluetooth|LAN|NIC| net "
         'f' = "Firmware|BIOS|System Hardware"
         's' = "Audio|Sound|Realtek|Media"
         'v' = "Graphics|Display|Video|NVIDIA|AMD|Radeon|Intel.*Graphics"
         'o' = "Card Reader|Camera|Sensor|PCI|USB"
-        't' = "Touchpad|Synaptics|HID|Input|Trackpad"
+        't' = "Touchpad|Synaptics|ELAN|HID|Input|Trackpad"
         'c' = "Chipset|Management Engine|MEI|Serial IO"
     }
 
