@@ -8,9 +8,10 @@ Installs Windows drivers with class filtering, per-driver streaming downloads/in
 .AUTHOR drkmccy
 
 .RELEASENOTES
-Version 1.03:	Connectivity check changed to actual Microsoft endpoints, driver type mapping improved
-Version 1.02:	Dropped download concurrency so switched to interleaved download>Install pipeline
-Version 1.01:	Single table output, tidied column headers, reboot prompt
+Version 1.04:	Connectivity check now displayed, added "other" driver type, tidied up the output table.
+Version 1.03:	Connectivity check changed to actual Microsoft endpoints, driver type mapping improved.
+Version 1.02:	Dropped download concurrency so switched to interleaved download>Install pipeline.
+Version 1.01:	Single table output, tidied column headers, reboot prompt.
 Version 1.00:	Added connectivity check, download concurrency, driver type filters, installation priority and visual overhaul.
 
 #>
@@ -21,7 +22,7 @@ Param(
     [Parameter(Mandatory = $False)] [Int32] $RebootTimeout = 120,
     [Parameter(Mandatory = $False)] [switch] $ExcludeDrivers = $false,
     [Parameter(Mandatory = $False)] [switch] $ExcludeUpdates = $true,
-    [Parameter(Mandatory = $False)] [String] $Class
+    [Parameter(Mandatory = $False)] [String] $DriverType
 )
 
 Begin {
@@ -33,21 +34,26 @@ Begin {
             $isOnline = $false
             
             foreach ($endpoint in $endpoints) {
+                Write-Host "  Testing endpoint: $endpoint... " -NoNewline
+                
                 # Try standard ICMP Ping first
                 if (Test-Connection -ComputerName $endpoint -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                    Write-Host "[OK] (Ping)" -ForegroundColor Green
                     $isOnline = $true
-                    break
-                }
-                # Fallback to TCP Port 443 check if ICMP is blocked on the network
-                $tcpTest = Test-NetConnection -ComputerName $endpoint -Port 443 -WarningAction SilentlyContinue
-                if ($tcpTest.TcpTestSucceeded) {
-                    $isOnline = $true
-                    break
+                } else {
+                    # Fallback to TCP Port 443 check if ICMP is blocked
+                    $tcpTest = Test-NetConnection -ComputerName $endpoint -Port 443 -WarningAction SilentlyContinue
+                    if ($tcpTest.TcpTestSucceeded) {
+                        Write-Host "[OK] (HTTPS)" -ForegroundColor Green
+                        $isOnline = $true
+                    } else {
+                        Write-Host "[FAILURE]" -ForegroundColor Red
+                    }
                 }
             }
 
             if (-not $isOnline) {
-                Write-Host "[!] Cannot reach Windows Update endpoints ($($endpoints -join ', '))." -ForegroundColor Red
+                Write-Host "[!] Cannot reach Windows Update endpoints." -ForegroundColor Red
                 $choice = Read-Host "Connect to the internet and press Enter to retry (or type 'Q' to quit)"
                 if ($choice -eq 'Q' -or $choice -eq 'q') {
                     Write-Host "Execution cancelled." -ForegroundColor Yellow
@@ -68,7 +74,7 @@ Process {
             $scriptArgs = "-Reboot $Reboot -RebootTimeout $RebootTimeout"
             if ($ExcludeDrivers) { $scriptArgs += " -ExcludeDrivers" }
             if ($ExcludeUpdates) { $scriptArgs += " -ExcludeUpdates" }
-            if ($Class)          { $scriptArgs += " -Class `"$Class`"" }
+            if ($DriverType)     { $scriptArgs += " -DriverType `"$DriverType`"" }
 
             Start-Process "$($env:WINDIR)\SysNative\WindowsPowerShell\v1.0\powershell.exe" `
                 -ArgumentList "-ExecutionPolicy Bypass -NoProfile -File `"$PSCommandPath`" $scriptArgs" -Wait
@@ -121,49 +127,57 @@ Process {
         Exit 0
     }
 
-    # Driver Type Keyword Mapping & Title Filtering
-    $ClassMap = @{
+    # Known Driver Type Keyword Mapping (Explicit Categories)
+    $DriverTypeMap = @{
         'n' = "Network|Wi-Fi|Wireless|WLAN|Ethernet|Bluetooth|LAN|NIC| net "
         'f' = "Firmware|BIOS|System Hardware"
         's' = "Audio|Sound|Realtek|Media"
         'v' = "Graphics|Display|Video|NVIDIA|AMD|Radeon|Intel.*Graphics"
-        'o' = "Card Reader|Camera|Sensor|PCI|USB"
         't' = "Touchpad|Synaptics|ELAN|HID|Input|Trackpad"
-        'c' = "Chipset|Management Engine|MEI|Serial IO"
+        'c' = "Chipset|Management Engine|MEI|Serial IO| System "
     }
 
+    # Combined Regex for all explicitly defined categories
+    $allKnownRegex = "(?i)" + (($DriverTypeMap.Values) -join "|")
+
+    # Driver Type Filtering
     $FilteredUpdates = @()
-    if ($PSBoundParameters.ContainsKey('Class') -and -not [string]::IsNullOrWhiteSpace($Class)) {
-        $charList = $Class.ToLower().ToCharArray() | Select-Object -Unique
-        $regexPatterns = @()
-        foreach ($char in $charList) {
-            if ($ClassMap.ContainsKey([string]$char)) {
-                $regexPatterns += $ClassMap[[string]$char]
-            }
-        }
-        
-        if ($regexPatterns.Count -gt 0) {
-            $combinedRegex = "(?i)" + ($regexPatterns -join "|")
-            foreach ($upd in $RawUpdates) {
-                if ($upd.Title -match $combinedRegex) {
-                    $FilteredUpdates += $upd
+    if ($PSBoundParameters.ContainsKey('DriverType') -and -not [string]::IsNullOrWhiteSpace($DriverType)) {
+        $charList = $DriverType.ToLower().ToCharArray() | Select-Object -Unique
+
+        foreach ($upd in $RawUpdates) {
+            $matchFound = $false
+            foreach ($char in $charList) {
+                $cStr = [string]$char
+                if ($cStr -eq 'o') {
+                    # 'o' matches anything NOT covered by defined categories
+                    if ($upd.Title -notmatch $allKnownRegex) {
+                        $matchFound = $true
+                        break
+                    }
+                } elseif ($DriverTypeMap.ContainsKey($cStr)) {
+                    if ($upd.Title -match ("(?i)" + $DriverTypeMap[$cStr])) {
+                        $matchFound = $true
+                        break
+                    }
                 }
             }
-        } else {
-            $FilteredUpdates = @($RawUpdates)
+            if ($matchFound) {
+                $FilteredUpdates += $upd
+            }
         }
     } else {
         $FilteredUpdates = @($RawUpdates)
     }
 
     if ($FilteredUpdates.Count -eq 0) {
-        Write-Host "No drivers match the specified class filter: '$Class'" -ForegroundColor Yellow
+        Write-Host "No drivers match the specified driver type filter: '$DriverType'" -ForegroundColor Yellow
         Stop-Transcript
         Exit 0
     }
 
     # Sorting Logic: Prioritize Chipset Drivers First
-    $chipsetRegex = "(?i)Chipset|Management Engine|MEI|Serial IO"
+    $chipsetRegex = "(?i)" + $DriverTypeMap['c']
     $chipsetGroup = @()
     $otherGroup   = @()
 
@@ -183,8 +197,8 @@ Process {
     $script:needReboot = $false
 
     Write-Host "`nProcessing $TotalCount driver update(s)...`n" -ForegroundColor Cyan
-    Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "Count", "Status", "Title", "Type", "Reboot Needed") -ForegroundColor Cyan
-    Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "-----", "------", "-----", "----", "-------------") -ForegroundColor DarkGray
+    Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "Count", "Status", "Title", "Type", "Reboot") -ForegroundColor Cyan
+    Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "-----", "------", "-----", "----", "------") -ForegroundColor DarkGray
 
     # Streamlined Download & Install Pipeline Loop
     foreach ($upd in $OrderedUpdates) {
@@ -221,14 +235,14 @@ Process {
         $isSuccess = ($InstallResult.ResultCode -eq 2)
         if ($InstallResult.RebootRequired) { $script:needReboot = $true }
 
-        # Tag Type Classification
+        # Dynamic Type Labeling (Fallback defaults to 'Other')
         $type = "Other"
-        if ($upd.Title -match $chipsetRegex)      { $type = "Chipset" }
-        elseif ($upd.Title -match $ClassMap['n']) { $type = "Networking" }
-        elseif ($upd.Title -match $ClassMap['v']) { $type = "Video" }
-        elseif ($upd.Title -match $ClassMap['s']) { $type = "Sound" }
-        elseif ($upd.Title -match $ClassMap['f']) { $type = "Firmware" }
-        elseif ($upd.Title -match $ClassMap['t']) { $type = "Touchpad" }
+        if ($upd.Title -match $chipsetRegex)          { $type = "Chipset" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['n'])) { $type = "Networking" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['v'])) { $type = "Video" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['s'])) { $type = "Sound" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['f'])) { $type = "Firmware" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['t'])) { $type = "Touchpad" }
 
         $titleDisplay = if ($upd.Title.Length -gt 47) { $upd.Title.Substring(0, 44) + "..." } else { $upd.Title }
         $rebootNeededStr = if ($InstallResult.RebootRequired) { "Yes" } else { "No" }
@@ -238,7 +252,7 @@ Process {
         if ($isSuccess) {
             Write-Host ("{0,-11} " -f "[SUCCESS]") -ForegroundColor Green -NoNewline
         } else {
-            Write-Host ("{0,-11} " -f "[FAILED]") -ForegroundColor Red -NoNewline
+            Write-Host ("{0,-11} " -f "[FAILURE]") -ForegroundColor Red -NoNewline
         }
         Write-Host ("{0,-50} {1,-15} {2}" -f $titleDisplay, $type, $rebootNeededStr)
     }
