@@ -8,6 +8,7 @@ Installs Windows drivers with class filtering, per-driver streaming downloads/in
 .AUTHOR drkmccy
 
 .RELEASENOTES
+Version 1.05:	Repalced Write-Progress with [Console]::Write, improved feedback
 Version 1.04:	Connectivity check now displayed, added "other" driver type, tidied up the output table.
 Version 1.03:	Connectivity check changed to actual Microsoft endpoints, driver type mapping improved.
 Version 1.02:	Dropped download concurrency so switched to interleaved download>Install pipeline.
@@ -26,6 +27,9 @@ Param(
 )
 
 Begin {
+    $ProgressPreference = 'SilentlyContinue'
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
     # 1. Internet & Endpoint Connectivity Verification
     function Test-InternetAccess {
         $endpoints = @("download.windowsupdate.com", "sls.update.microsoft.com", "www.microsoft.com")
@@ -34,20 +38,29 @@ Begin {
             $isOnline = $false
             
             foreach ($endpoint in $endpoints) {
-                Write-Host "  Testing endpoint: $endpoint... " -NoNewline
+                [Console]::Write("`r  Testing endpoint: $endpoint... ...   ")
                 
                 # Try standard ICMP Ping first
                 if (Test-Connection -ComputerName $endpoint -Count 1 -Quiet -ErrorAction SilentlyContinue) {
-                    Write-Host "[OK] (Ping)" -ForegroundColor Green
+                    [Console]::Write("`r  Testing endpoint: $endpoint... ")
+                    [Console]::ForegroundColor = [ConsoleColor]::Green
+                    [Console]::WriteLine("[OK] (Ping)     ")
+                    [Console]::ResetColor()
                     $isOnline = $true
                 } else {
                     # Fallback to TCP Port 443 check if ICMP is blocked
                     $tcpTest = Test-NetConnection -ComputerName $endpoint -Port 443 -WarningAction SilentlyContinue
                     if ($tcpTest.TcpTestSucceeded) {
-                        Write-Host "[OK] (HTTPS)" -ForegroundColor Green
+                        [Console]::Write("`r  Testing endpoint: $endpoint... ")
+                        [Console]::ForegroundColor = [ConsoleColor]::Green
+                        [Console]::WriteLine("[OK] (HTTPS)    ")
+                        [Console]::ResetColor()
                         $isOnline = $true
                     } else {
-                        Write-Host "[FAILURE]" -ForegroundColor Red
+                        [Console]::Write("`r  Testing endpoint: $endpoint... ")
+                        [Console]::ForegroundColor = [ConsoleColor]::Red
+                        [Console]::WriteLine("[FAILURE]       ")
+                        [Console]::ResetColor()
                     }
                 }
             }
@@ -100,7 +113,7 @@ Process {
     elseif ($ExcludeUpdates) { $queries = @("IsInstalled=0 and Type='Driver'") }
     else                     { $queries = @("IsInstalled=0 and Type='Software'", "IsInstalled=0 and Type='Driver'") }
 
-    Write-Progress -Activity "Windows Driver Update" -Status "Searching for available updates..." -PercentComplete 5
+    [Console]::Write("`rSearching for available driver updates... ...   ")
     $Session = New-Object -ComObject Microsoft.Update.Session
     $Searcher = $Session.CreateUpdateSearcher()
     $RawUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
@@ -120,6 +133,8 @@ Process {
             Write-Warning "Unable to search updates: $_"
         }
     }
+
+    [Console]::WriteLine("`rSearching for available driver updates... Done!   ")
 
     if ($RawUpdates.Count -eq 0) {
         Write-Host "No updates found." -ForegroundColor Yellow
@@ -197,10 +212,10 @@ Process {
     $script:needReboot = $false
 
     Write-Host "`nProcessing $TotalCount driver update(s)...`n" -ForegroundColor Cyan
-    Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "Count", "Status", "Title", "Type", "Reboot") -ForegroundColor Cyan
-    Write-Host ("{0,-7} {1,-11} {2,-50} {3,-15} {4}" -f "-----", "------", "-----", "----", "------") -ForegroundColor DarkGray
+    Write-Host ("{0,-7} {1,-22} {2,-50} {3,-15} {4}" -f @("Count", "Status", "Title", "Type", "Reboot")) -ForegroundColor Cyan
+    Write-Host ("{0,-7} {1,-22} {2,-50} {3,-15} {4}" -f @("-----", "------", "-----", "----", "------")) -ForegroundColor DarkGray
 
-    # Streamlined Download & Install Pipeline Loop
+    # Streaming Download & Install Loop with Live Console Overwrites
     foreach ($upd in $OrderedUpdates) {
         $CurrentIndex++
         $countStr = $CurrentIndex.ToString("D$padWidth")
@@ -209,23 +224,40 @@ Process {
         $sizeMB = [math]::Round($upd.MaxDownloadSize / 1MB, 2)
         $sizeDisplay = if ($sizeMB -gt 0) { "$sizeMB MB" } else { "< 1 MB" }
 
+        # Tag Type Classification
+        $type = "Other"
+        if ($upd.Title -match $chipsetRegex)                      { $type = "Chipset" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['n'])) { $type = "Networking" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['v'])) { $type = "Video" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['s'])) { $type = "Sound" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['f'])) { $type = "Firmware" }
+        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['t'])) { $type = "Touchpad" }
+
+        $titleDisplay = if ($upd.Title.Length -gt 47) { $upd.Title.Substring(0, 44) + "..." } else { $upd.Title }
+
         # Single Item Collection
         $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
         [void]$singleColl.Add($upd)
 
-        # 1. Download Step
-        Write-Progress -Activity "Driver Processing [$countStr/$TotalCount]" `
-            -Status "Downloading ($sizeDisplay): $($upd.Title)" `
-            -PercentComplete ((($CurrentIndex - 0.5) / $TotalCount) * 100)
+        # 1. LIVE UPDATE: Download Phase (Cyan Status)
+        $dlStatusStr = "Download ($sizeDisplay)"
+        [Console]::Write("`r{0,-7} " -f $countStr)
+        [Console]::ForegroundColor = [ConsoleColor]::Cyan
+        [Console]::Write("{0,-22} " -f $dlStatusStr)
+        [Console]::ResetColor()
+        [Console]::Write("{0,-50} {1,-15}" -f @($titleDisplay, $type))
 
         $Downloader = $Session.CreateUpdateDownloader()
         $Downloader.Updates = $singleColl
         $DownloadResult = $Downloader.Download()
 
-        # 2. Install Step
-        Write-Progress -Activity "Driver Processing [$countStr/$TotalCount]" `
-            -Status "Installing: $($upd.Title)" `
-            -PercentComplete (($CurrentIndex / $TotalCount) * 100)
+        # 2. LIVE UPDATE: Install Phase (Yellow Status)
+        $instStatusStr = "Installing..."
+        [Console]::Write("`r{0,-7} " -f $countStr)
+        [Console]::ForegroundColor = [ConsoleColor]::Yellow
+        [Console]::Write("{0,-22} " -f $instStatusStr)
+        [Console]::ResetColor()
+        [Console]::Write("{0,-50} {1,-15}" -f @($titleDisplay, $type))
 
         $Installer = $Session.CreateUpdateInstaller()
         $Installer.Updates = $singleColl
@@ -234,31 +266,22 @@ Process {
         $InstallResult = $Installer.Install()
         $isSuccess = ($InstallResult.ResultCode -eq 2)
         if ($InstallResult.RebootRequired) { $script:needReboot = $true }
-
-        # Dynamic Type Labeling (Fallback defaults to 'Other')
-        $type = "Other"
-        if ($upd.Title -match $chipsetRegex)          { $type = "Chipset" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['n'])) { $type = "Networking" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['v'])) { $type = "Video" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['s'])) { $type = "Sound" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['f'])) { $type = "Firmware" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['t'])) { $type = "Touchpad" }
-
-        $titleDisplay = if ($upd.Title.Length -gt 47) { $upd.Title.Substring(0, 44) + "..." } else { $upd.Title }
         $rebootNeededStr = if ($InstallResult.RebootRequired) { "Yes" } else { "No" }
 
-        # Output dynamic row immediately upon install completion
-        Write-Host ("{0,-7} " -f $countStr) -NoNewline
+        # 3. FINAL LOCK-IN: Overwrite row with [SUCCESS] (Green) or [FAILURE] (Red) and finalize line break
+        [Console]::Write("`r{0,-7} " -f $countStr)
         if ($isSuccess) {
-            Write-Host ("{0,-11} " -f "[SUCCESS]") -ForegroundColor Green -NoNewline
+            [Console]::ForegroundColor = [ConsoleColor]::Green
+            [Console]::Write("{0,-22} " -f "[SUCCESS]")
         } else {
-            Write-Host ("{0,-11} " -f "[FAILURE]") -ForegroundColor Red -NoNewline
+            [Console]::ForegroundColor = [ConsoleColor]::Red
+            [Console]::Write("{0,-22} " -f "[FAILURE]")
         }
-        Write-Host ("{0,-50} {1,-15} {2}" -f $titleDisplay, $type, $rebootNeededStr)
+        [Console]::ResetColor()
+        [Console]::WriteLine("{0,-50} {1,-15} {2}   " -f @($titleDisplay, $type, $rebootNeededStr))
     }
 
-    Write-Progress -Activity "Driver Processing" -Completed
-    Write-Host ""
+    [Console]::WriteLine("")
 
     # Interactive Reboot Verification
     if ($script:needReboot) {
