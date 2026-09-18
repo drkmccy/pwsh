@@ -8,7 +8,8 @@ Installs Windows drivers with class filtering, per-driver streaming downloads/in
 .AUTHOR drkmccy
 
 .RELEASENOTES
-Version 1.05:	Repalced Write-Progress with [Console]::Write, improved feedback
+Version 1.06:	Changed connectivity check to actual Windows Update endpoints, tidied up table output.
+Version 1.05:	Replaced Write-Progress with [Console]::Write, improved feedback.
 Version 1.04:	Connectivity check now displayed, added "other" driver type, tidied up the output table.
 Version 1.03:	Connectivity check changed to actual Microsoft endpoints, driver type mapping improved.
 Version 1.02:	Dropped download concurrency so switched to interleaved download>Install pipeline.
@@ -32,49 +33,55 @@ Begin {
 
     # 1. Internet & Endpoint Connectivity Verification
     function Test-InternetAccess {
-        $endpoints = @("download.windowsupdate.com", "sls.update.microsoft.com", "www.microsoft.com")
+        $endpoints = @(
+            "windowsupdate.microsoft.com",
+            "download.windowsupdate.com",
+            "go.microsoft.com",
+            "ctldl.windowsupdate.com"
+        )
         do {
-            Write-Host "Checking connectivity to Windows Update endpoints..." -ForegroundColor Cyan
-            $isOnline = $false
-            
+            Write-Host "Checking connectivity to Windows Update endpoints...`n" -ForegroundColor Cyan
+            Write-Host ("{0,-35} {1,-10}" -f @("Endpoint", "Status")) -ForegroundColor Cyan
+            Write-Host ("{0,-35} {1,-10}" -f @("--------", "------")) -ForegroundColor DarkGray
+
+            $allOnline = $true
+
             foreach ($endpoint in $endpoints) {
-                [Console]::Write("`r  Testing endpoint: $endpoint... ...   ")
-                
+                [Console]::Write("{0,-35} " -f $endpoint)
+
+                $isOnline = $false
                 # Try standard ICMP Ping first
                 if (Test-Connection -ComputerName $endpoint -Count 1 -Quiet -ErrorAction SilentlyContinue) {
-                    [Console]::Write("`r  Testing endpoint: $endpoint... ")
-                    [Console]::ForegroundColor = [ConsoleColor]::Green
-                    [Console]::WriteLine("[OK] (Ping)     ")
-                    [Console]::ResetColor()
                     $isOnline = $true
                 } else {
                     # Fallback to TCP Port 443 check if ICMP is blocked
                     $tcpTest = Test-NetConnection -ComputerName $endpoint -Port 443 -WarningAction SilentlyContinue
                     if ($tcpTest.TcpTestSucceeded) {
-                        [Console]::Write("`r  Testing endpoint: $endpoint... ")
-                        [Console]::ForegroundColor = [ConsoleColor]::Green
-                        [Console]::WriteLine("[OK] (HTTPS)    ")
-                        [Console]::ResetColor()
                         $isOnline = $true
-                    } else {
-                        [Console]::Write("`r  Testing endpoint: $endpoint... ")
-                        [Console]::ForegroundColor = [ConsoleColor]::Red
-                        [Console]::WriteLine("[FAILURE]       ")
-                        [Console]::ResetColor()
                     }
                 }
+
+                if ($isOnline) {
+                    [Console]::ForegroundColor = [ConsoleColor]::Green
+                    [Console]::WriteLine("[OK]")
+                } else {
+                    [Console]::ForegroundColor = [ConsoleColor]::Red
+                    [Console]::WriteLine("[KO]")
+                    $allOnline = $false
+                }
+                [Console]::ResetColor()
             }
 
-            if (-not $isOnline) {
-                Write-Host "[!] Cannot reach Windows Update endpoints." -ForegroundColor Red
+            if (-not $allOnline) {
+                Write-Host "`n[!] Cannot reach required Windows Update endpoints." -ForegroundColor Red
                 $choice = Read-Host "Connect to the internet and press Enter to retry (or type 'Q' to quit)"
                 if ($choice -eq 'Q' -or $choice -eq 'q') {
                     Write-Host "Execution cancelled." -ForegroundColor Yellow
                     Exit 1
                 }
             }
-        } while (-not $isOnline)
-        Write-Host "[+] Connection to Windows Update endpoints confirmed.`n" -ForegroundColor Green
+        } while (-not $allOnline)
+        Write-Host "`n[+] Connection to Windows Update endpoints confirmed.`n" -ForegroundColor Green
     }
 }
 
@@ -113,7 +120,7 @@ Process {
     elseif ($ExcludeUpdates) { $queries = @("IsInstalled=0 and Type='Driver'") }
     else                     { $queries = @("IsInstalled=0 and Type='Software'", "IsInstalled=0 and Type='Driver'") }
 
-    [Console]::Write("`rSearching for available driver updates... ...   ")
+    [Console]::Write("`rSearching for available driver updates...   ")
     $Session = New-Object -ComObject Microsoft.Update.Session
     $Searcher = $Session.CreateUpdateSearcher()
     $RawUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
@@ -212,13 +219,14 @@ Process {
     $script:needReboot = $false
 
     Write-Host "`nProcessing $TotalCount driver update(s)...`n" -ForegroundColor Cyan
-    Write-Host ("{0,-7} {1,-22} {2,-50} {3,-15} {4}" -f @("Count", "Status", "Title", "Type", "Reboot")) -ForegroundColor Cyan
-    Write-Host ("{0,-7} {1,-22} {2,-50} {3,-15} {4}" -f @("-----", "------", "-----", "----", "------")) -ForegroundColor DarkGray
+    Write-Host ("{0,-4} {1,-50} {2,-15} {3,-8} {4,-22}" -f @("#", "Title", "Type", "Reboot", "Status")) -ForegroundColor Cyan
+    Write-Host ("{0,-4} {1,-50} {2,-15} {3,-8} {4,-22}" -f @("---", "-----", "----", "------", "------")) -ForegroundColor DarkGray
 
     # Streaming Download & Install Loop with Live Console Overwrites
     foreach ($upd in $OrderedUpdates) {
         $CurrentIndex++
-        $countStr = $CurrentIndex.ToString("D$padWidth")
+        $remainingCount = $TotalCount - $CurrentIndex + 1
+        $countStr = $remainingCount.ToString("D$padWidth")
 
         # Calculate Size
         $sizeMB = [math]::Round($upd.MaxDownloadSize / 1MB, 2)
@@ -239,25 +247,23 @@ Process {
         $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
         [void]$singleColl.Add($upd)
 
-        # 1. LIVE UPDATE: Download Phase (Cyan Status)
+        # 1. LIVE UPDATE: Download Phase (Status at End)
         $dlStatusStr = "Download ($sizeDisplay)"
-        [Console]::Write("`r{0,-7} " -f $countStr)
+        [Console]::Write("`r{0,-4} {1,-50} {2,-15} {3,-8} " -f @($countStr, $titleDisplay, $type, "-"))
         [Console]::ForegroundColor = [ConsoleColor]::Cyan
-        [Console]::Write("{0,-22} " -f $dlStatusStr)
+        [Console]::Write("{0,-22}" -f $dlStatusStr)
         [Console]::ResetColor()
-        [Console]::Write("{0,-50} {1,-15}" -f @($titleDisplay, $type))
 
         $Downloader = $Session.CreateUpdateDownloader()
         $Downloader.Updates = $singleColl
         $DownloadResult = $Downloader.Download()
 
-        # 2. LIVE UPDATE: Install Phase (Yellow Status)
+        # 2. LIVE UPDATE: Install Phase (Status at End)
         $instStatusStr = "Installing..."
-        [Console]::Write("`r{0,-7} " -f $countStr)
+        [Console]::Write("`r{0,-4} {1,-50} {2,-15} {3,-8} " -f @($countStr, $titleDisplay, $type, "-"))
         [Console]::ForegroundColor = [ConsoleColor]::Yellow
-        [Console]::Write("{0,-22} " -f $instStatusStr)
+        [Console]::Write("{0,-22}" -f $instStatusStr)
         [Console]::ResetColor()
-        [Console]::Write("{0,-50} {1,-15}" -f @($titleDisplay, $type))
 
         $Installer = $Session.CreateUpdateInstaller()
         $Installer.Updates = $singleColl
@@ -268,17 +274,17 @@ Process {
         if ($InstallResult.RebootRequired) { $script:needReboot = $true }
         $rebootNeededStr = if ($InstallResult.RebootRequired) { "Yes" } else { "No" }
 
-        # 3. FINAL LOCK-IN: Overwrite row with [SUCCESS] (Green) or [FAILURE] (Red) and finalize line break
-        [Console]::Write("`r{0,-7} " -f $countStr)
+        # 3. FINAL LOCK-IN: Overwrite line with final Reboot status and [SUCCESS] or [FAILURE]
+        [Console]::Write("`r{0,-4} {1,-50} {2,-15} {3,-8} " -f @($countStr, $titleDisplay, $type, $rebootNeededStr))
         if ($isSuccess) {
             [Console]::ForegroundColor = [ConsoleColor]::Green
-            [Console]::Write("{0,-22} " -f "[SUCCESS]")
+            [Console]::Write("{0,-22}" -f "[SUCCESS]")
         } else {
             [Console]::ForegroundColor = [ConsoleColor]::Red
-            [Console]::Write("{0,-22} " -f "[FAILURE]")
+            [Console]::Write("{0,-22}" -f "[FAILURE]")
         }
         [Console]::ResetColor()
-        [Console]::WriteLine("{0,-50} {1,-15} {2}   " -f @($titleDisplay, $type, $rebootNeededStr))
+        [Console]::WriteLine("")
     }
 
     [Console]::WriteLine("")
