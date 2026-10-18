@@ -8,7 +8,7 @@ Installs Windows drivers with class filtering, per-driver streaming downloads/in
 .AUTHOR drkmccy
 
 .RELEASENOTES
-Version 1.07:	Added install failure retry loop logic, fixed update endpoint check bug.
+Version 1.07:	Added retry loop logic for install failures, fixed update endpoint check bug.
 Version 1.06:	Changed connectivity check to actual Windows Update endpoints, tidied up table output.
 Version 1.05:	Replaced Write-Progress with [Console]::Write, improved feedback.
 Version 1.04:	Connectivity check now displayed, added "other" driver type, tidied up the output table.
