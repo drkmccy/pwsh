@@ -8,6 +8,7 @@ Installs Windows drivers with class filtering, per-driver streaming downloads/in
 .AUTHOR drkmccy
 
 .RELEASENOTES
+Version 1.07:	Added install failure retry loop logic, fixed update endpoint check bug.
 Version 1.06:	Changed connectivity check to actual Windows Update endpoints, tidied up table output.
 Version 1.05:	Replaced Write-Progress with [Console]::Write, improved feedback.
 Version 1.04:	Connectivity check now displayed, added "other" driver type, tidied up the output table.
@@ -34,30 +35,34 @@ Begin {
     # 1. Internet & Endpoint Connectivity Verification
     function Test-InternetAccess {
         $endpoints = @(
-            "windowsupdate.microsoft.com",
-            "download.windowsupdate.com",
-            "go.microsoft.com",
-            "ctldl.windowsupdate.com"
+            @{ Host = "windowsupdate.microsoft.com"; TcpOnly = $true },
+            @{ Host = "download.windowsupdate.com";  TcpOnly = $false },
+            @{ Host = "go.microsoft.com";            TcpOnly = $false },
+            @{ Host = "ctldl.windowsupdate.com";     TcpOnly = $false }
         )
         do {
             Write-Host "Checking connectivity to Windows Update endpoints...`n" -ForegroundColor Cyan
             Write-Host ("{0,-35} {1,-10}" -f @("Endpoint", "Status")) -ForegroundColor Cyan
             Write-Host ("{0,-35} {1,-10}" -f @("--------", "------")) -ForegroundColor DarkGray
 
-            $allOnline = $true
+            $allOnline =$true
 
-            foreach ($endpoint in $endpoints) {
+            foreach ($ep in$endpoints) {
+                $endpoint =$ep.Host
                 [Console]::Write("{0,-35} " -f $endpoint)
 
-                $isOnline = $false
-                # Try standard ICMP Ping first
-                if (Test-Connection -ComputerName $endpoint -Count 1 -Quiet -ErrorAction SilentlyContinue) {
-                    $isOnline = $true
+                $isOnline =$false
+                if ($ep.TcpOnly) {
+                    # Explicit TCP Port 443 check only
+                    $tcpTest = Test-NetConnection -ComputerName$endpoint -Port 443 -WarningAction SilentlyContinue
+                    if ($tcpTest.TcpTestSucceeded) { $isOnline =$true }
                 } else {
-                    # Fallback to TCP Port 443 check if ICMP is blocked
-                    $tcpTest = Test-NetConnection -ComputerName $endpoint -Port 443 -WarningAction SilentlyContinue
-                    if ($tcpTest.TcpTestSucceeded) {
-                        $isOnline = $true
+                    # ICMP Ping first, fallback to TCP 443
+                    if (Test-Connection -ComputerName $endpoint -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                        $isOnline =$true
+                    } else {
+                        $tcpTest = Test-NetConnection -ComputerName$endpoint -Port 443 -WarningAction SilentlyContinue
+                        if ($tcpTest.TcpTestSucceeded) { $isOnline =$true }
                     }
                 }
 
@@ -67,7 +72,7 @@ Begin {
                 } else {
                     [Console]::ForegroundColor = [ConsoleColor]::Red
                     [Console]::WriteLine("[KO]")
-                    $allOnline = $false
+                    $allOnline =$false
                 }
                 [Console]::ResetColor()
             }
@@ -82,6 +87,32 @@ Begin {
             }
         } while (-not $allOnline)
         Write-Host "`n[+] Connection to Windows Update endpoints confirmed.`n" -ForegroundColor Green
+    }
+
+    # Helper function for non-blocking timeout prompt
+    function Get-InputWithTimeout {
+        param([string]$PromptText, [int]$TimeoutSeconds = 10)
+        
+        $startTime = [DateTime]::Now
+        while (([DateTime]::Now - $startTime).TotalSeconds -lt $TimeoutSeconds) {
+            $secondsLeft = [math]::Max(0, [int]($TimeoutSeconds - ([DateTime]::Now - $startTime).TotalSeconds))
+            [Console]::Write("`r$PromptText ($secondsLeft`s left): ")
+            
+            if ([Console]::KeyAvailable) {
+                $keyInfo = [Console]::ReadKey($true)
+                if ($keyInfo.Key -eq [ConsoleKey]::Enter) {
+                    [Console]::WriteLine("")
+                    return ""
+                } else {
+                    $keyChar = $keyInfo.KeyChar.ToString()
+                    [Console]::WriteLine($keyChar)
+                    return $keyChar
+                }
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        [Console]::WriteLine("")
+        return "" # Default retry action on timeout
     }
 }
 
@@ -116,8 +147,8 @@ Process {
     $ServiceManager.AddService2($ServiceID, 7, "") | Out-Null
 
     # Build Queries
-    if ($ExcludeDrivers)     { $queries = @("IsInstalled=0 and Type='Software'") }
-    elseif ($ExcludeUpdates) { $queries = @("IsInstalled=0 and Type='Driver'") }
+    if ($ExcludeDrivers)     {$queries = @("IsInstalled=0 and Type='Software'") }
+    elseif ($ExcludeUpdates) {$queries = @("IsInstalled=0 and Type='Driver'") }
     else                     { $queries = @("IsInstalled=0 and Type='Software'", "IsInstalled=0 and Type='Driver'") }
 
     [Console]::Write("`rSearching for available driver updates...   ")
@@ -165,27 +196,26 @@ Process {
     # Driver Type Filtering
     $FilteredUpdates = @()
     if ($PSBoundParameters.ContainsKey('DriverType') -and -not [string]::IsNullOrWhiteSpace($DriverType)) {
-        $charList = $DriverType.ToLower().ToCharArray() | Select-Object -Unique
+        $charList =$DriverType.ToLower().ToCharArray() | Select-Object -Unique
 
-        foreach ($upd in $RawUpdates) {
-            $matchFound = $false
-            foreach ($char in $charList) {
+        foreach ($upd in$RawUpdates) {
+            $matchFound =$false
+            foreach ($char in$charList) {
                 $cStr = [string]$char
                 if ($cStr -eq 'o') {
-                    # 'o' matches anything NOT covered by defined categories
-                    if ($upd.Title -notmatch $allKnownRegex) {
-                        $matchFound = $true
+                    if ($upd.Title -notmatch$allKnownRegex) {
+                        $matchFound =$true
                         break
                     }
                 } elseif ($DriverTypeMap.ContainsKey($cStr)) {
                     if ($upd.Title -match ("(?i)" + $DriverTypeMap[$cStr])) {
-                        $matchFound = $true
+                        $matchFound =$true
                         break
                     }
                 }
             }
             if ($matchFound) {
-                $FilteredUpdates += $upd
+                $FilteredUpdates +=$upd
             }
         }
     } else {
@@ -200,94 +230,119 @@ Process {
 
     # Sorting Logic: Prioritize Chipset Drivers First
     $chipsetRegex = "(?i)" + $DriverTypeMap['c']
-    $chipsetGroup = @()
-    $otherGroup   = @()
+    $chipsetGroup = @()$otherGroup   = @()
 
-    foreach ($upd in $FilteredUpdates) {
-        if ($upd.Title -match $chipsetRegex) {
-            $chipsetGroup += $upd
+    foreach ($upd in$FilteredUpdates) {
+        if ($upd.Title -match$chipsetRegex) {
+            $chipsetGroup +=$upd
         } else {
-            $otherGroup += $upd
+            $otherGroup +=$upd
         }
     }
-    $OrderedUpdates = $chipsetGroup + $otherGroup
+    
+    $BatchToProcess =$chipsetGroup + $otherGroup$script:needReboot = $false$previousFailureCount = [int]::MaxValue
 
-    # Setup Dynamic Counters and Visual Table Header
-    $TotalCount   = $OrderedUpdates.Count
-    $padWidth     = $TotalCount.ToString().Length
-    $CurrentIndex = 0
-    $script:needReboot = $false
+    # Installation and Retry Loop
+    do {
+        $TotalCount   =$BatchToProcess.Count
+        $padWidth     =$TotalCount.ToString().Length
+        $CurrentIndex = 0$failedUpdates = @()
 
-    Write-Host "`nProcessing $TotalCount driver update(s)...`n" -ForegroundColor Cyan
-    Write-Host ("{0,-4} {1,-50} {2,-15} {3,-8} {4,-22}" -f @("#", "Title", "Type", "Reboot", "Status")) -ForegroundColor Cyan
-    Write-Host ("{0,-4} {1,-50} {2,-15} {3,-8} {4,-22}" -f @("---", "-----", "----", "------", "------")) -ForegroundColor DarkGray
+        Write-Host "`nProcessing $TotalCount driver update(s)...`n" -ForegroundColor Cyan
+        Write-Host ("{0,-4} {1,-50} {2,-15} {3,-8} {4,-22}" -f @("#", "Title", "Type", "Reboot", "Status")) -ForegroundColor Cyan
+        Write-Host ("{0,-4} {1,-50} {2,-15} {3,-8} {4,-22}" -f @("---", "-----", "----", "------", "------")) -ForegroundColor DarkGray
 
-    # Streaming Download & Install Loop with Live Console Overwrites
-    foreach ($upd in $OrderedUpdates) {
-        $CurrentIndex++
-        $remainingCount = $TotalCount - $CurrentIndex + 1
-        $countStr = $remainingCount.ToString("D$padWidth")
+        foreach ($upd in $BatchToProcess) {$CurrentIndex++
+            $remainingCount =$TotalCount - $CurrentIndex + 1$countStr = $remainingCount.ToString("D$padWidth")
 
-        # Calculate Size
-        $sizeMB = [math]::Round($upd.MaxDownloadSize / 1MB, 2)
-        $sizeDisplay = if ($sizeMB -gt 0) { "$sizeMB MB" } else { "< 1 MB" }
+            # Calculate Size
+            $sizeMB = [math]::Round($upd.MaxDownloadSize / 1MB, 2)$sizeDisplay = if ($sizeMB -gt 0) { "$sizeMB MB" } else { "< 1 MB" }
 
-        # Tag Type Classification
-        $type = "Other"
-        if ($upd.Title -match $chipsetRegex)                      { $type = "Chipset" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['n'])) { $type = "Networking" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['v'])) { $type = "Video" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['s'])) { $type = "Sound" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['f'])) { $type = "Firmware" }
-        elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['t'])) { $type = "Touchpad" }
+            # Tag Type Classification
+            $type = "Other"
+            if ($upd.Title -match $chipsetRegex)                      {$type = "Chipset" }
+            elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['n'])) {$type = "Networking" }
+            elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['v'])) {$type = "Video" }
+            elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['s'])) {$type = "Sound" }
+            elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['f'])) {$type = "Firmware" }
+            elseif ($upd.Title -match ("(?i)" + $DriverTypeMap['t'])) {$type = "Touchpad" }
 
-        $titleDisplay = if ($upd.Title.Length -gt 47) { $upd.Title.Substring(0, 44) + "..." } else { $upd.Title }
+            $titleDisplay = if ($upd.Title.Length -gt 47) { $upd.Title.Substring(0, 44) + "..." } else { $upd.Title }
 
-        # Single Item Collection
-        $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
-        [void]$singleColl.Add($upd)
+            # Single Item Collection
+            $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
+            [void]$singleColl.Add($upd)
 
-        # 1. LIVE UPDATE: Download Phase (Status at End)
-        $dlStatusStr = "Download ($sizeDisplay)"
-        [Console]::Write("`r{0,-4} {1,-50} {2,-15} {3,-8} " -f @($countStr, $titleDisplay, $type, "-"))
-        [Console]::ForegroundColor = [ConsoleColor]::Cyan
-        [Console]::Write("{0,-22}" -f $dlStatusStr)
-        [Console]::ResetColor()
+            # 1. LIVE UPDATE: Download Phase
+            $dlStatusStr = "Download ($sizeDisplay)"
+            [Console]::Write("`r{0,-4} {1,-50} {2,-15} {3,-8} " -f @($countStr, $titleDisplay, $type, "-"))
+            [Console]::ForegroundColor = [ConsoleColor]::Cyan
+            [Console]::Write("{0,-22}" -f $dlStatusStr)
+            [Console]::ResetColor()
 
-        $Downloader = $Session.CreateUpdateDownloader()
-        $Downloader.Updates = $singleColl
-        $DownloadResult = $Downloader.Download()
+            $Downloader = $Session.CreateUpdateDownloader()
+            $Downloader.Updates = $singleColl
+            $DownloadResult = $Downloader.Download()
 
-        # 2. LIVE UPDATE: Install Phase (Status at End)
-        $instStatusStr = "Installing..."
-        [Console]::Write("`r{0,-4} {1,-50} {2,-15} {3,-8} " -f @($countStr, $titleDisplay, $type, "-"))
-        [Console]::ForegroundColor = [ConsoleColor]::Yellow
-        [Console]::Write("{0,-22}" -f $instStatusStr)
-        [Console]::ResetColor()
+            # 2. LIVE UPDATE: Install Phase
+            $instStatusStr = "Installing..."
+            [Console]::Write("`r{0,-4} {1,-50} {2,-15} {3,-8} " -f @($countStr, $titleDisplay,$type, "-"))
+            [Console]::ForegroundColor = [ConsoleColor]::Yellow
+            [Console]::Write("{0,-22}" -f $instStatusStr)
+            [Console]::ResetColor()
 
-        $Installer = $Session.CreateUpdateInstaller()
-        $Installer.Updates = $singleColl
-        $Installer.ForceQuiet = $true
+            $Installer =$Session.CreateUpdateInstaller()
+            $Installer.Updates =$singleColl
+            $Installer.ForceQuiet =$true
 
-        $InstallResult = $Installer.Install()
-        $isSuccess = ($InstallResult.ResultCode -eq 2)
-        if ($InstallResult.RebootRequired) { $script:needReboot = $true }
-        $rebootNeededStr = if ($InstallResult.RebootRequired) { "Yes" } else { "No" }
+            $InstallResult =$Installer.Install()
+            $isSuccess = ($InstallResult.ResultCode -eq 2)
+            if ($InstallResult.RebootRequired) { $script:needReboot =$true }
+            $rebootNeededStr = if ($InstallResult.RebootRequired) { "Yes" } else { "No" }
 
-        # 3. FINAL LOCK-IN: Overwrite line with final Reboot status and [SUCCESS] or [FAILURE]
-        [Console]::Write("`r{0,-4} {1,-50} {2,-15} {3,-8} " -f @($countStr, $titleDisplay, $type, $rebootNeededStr))
-        if ($isSuccess) {
-            [Console]::ForegroundColor = [ConsoleColor]::Green
-            [Console]::Write("{0,-22}" -f "[SUCCESS]")
-        } else {
-            [Console]::ForegroundColor = [ConsoleColor]::Red
-            [Console]::Write("{0,-22}" -f "[FAILURE]")
+            # 3. FINAL LOCK-IN: Overwrite line with [SUCCESS] or [FAILURE]
+            [Console]::Write("`r{0,-4} {1,-50} {2,-15} {3,-8} " -f @($countStr, $titleDisplay, $type, $rebootNeededStr))
+            if ($isSuccess) {
+                [Console]::ForegroundColor = [ConsoleColor]::Green
+                [Console]::Write("{0,-22}" -f "[SUCCESS]")
+            } else {
+                [Console]::ForegroundColor = [ConsoleColor]::Red
+                [Console]::Write("{0,-22}" -f "[FAILURE]")
+                $failedUpdates += $upd
+            }
+            [Console]::ResetColor()
+            [Console]::WriteLine("")
         }
-        [Console]::ResetColor()
+
         [Console]::WriteLine("")
-    }
 
-    [Console]::WriteLine("")
+        # Evaluate Failures and Prompt Logic
+        if ($failedUpdates.Count -gt 0) {
+            # Check if failures did not decrease compared to previous run
+            if ($failedUpdates.Count -ge $previousFailureCount) {
+                Write-Host "[!] $($failedUpdates.Count) driver(s) failed to install again. Stopping retry attempts." -ForegroundColor Red
+                break
+            }
+
+            $previousFailureCount = $failedUpdates.Count
+            Write-Host "[!] $($failedUpdates.Count) driver installation(s) failed." -ForegroundColor Yellow
+            $userChoice = Get-InputWithTimeout -PromptText "Press Enter to retry failed installs, 'R' to reboot, or 'Q' to quit" -TimeoutSeconds 10
+
+            if ($userChoice -match "^[Qq]$") {
+                Write-Host "Execution cancelled by user." -ForegroundColor Yellow
+                Stop-Transcript
+                Exit 1
+            } elseif ($userChoice -match "^[Rr]$") {
+                break # Exit retry loop to jump straight to reboot processing
+            } else {
+                # Retrying failed updates
+                $BatchToProcess = $failedUpdates
+                Write-Host "`nRetrying $($failedUpdates.Count) failed driver update(s)..." -ForegroundColor Cyan
+            }
+        } else {
+            break # No failures, exit retry loop
+        }
+    } while ($true)
 
     # Interactive Reboot Verification
     if ($script:needReboot) {
@@ -305,7 +360,7 @@ Process {
             Exit 0
         }
     } else {
-        Write-Host "All driver updates completed without requiring a reboot." -ForegroundColor Green
+        Write-Host "All processed driver updates completed without requiring a reboot." -ForegroundColor Green
         Stop-Transcript
         Exit 0
     }
